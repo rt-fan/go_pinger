@@ -1,0 +1,5 @@
+{
+  "database_url": "postgresql://postgres:postgres@<docker_gateway_ip>:5432/postgres",
+  "poll_interval_seconds": 30,
+  "workers": 60
+}
