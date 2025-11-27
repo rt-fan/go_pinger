@@ -1,0 +1,13 @@
+services:
+  pinger:
+    build: .
+    container_name: pinger
+    restart: always
+    volumes:
+      # Файл последнего скана сохраняется на хосте
+      - ./last_ping.json:/app/last_ping.json
+      # Конфиг подключений к БД
+      - ./dbconfig.json:/app/dbconfig.json
+    environment:
+      # (если использовал переменные в Go-коде)
+      TZ: "Europe/Moscow"
