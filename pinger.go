@@ -44,6 +44,7 @@ type PingResult struct {
 	GroupID      int    `json:"group_id"`
 	NetworkID    int    `json:"network_id"`
 	Recurrences  int    `json:"recurrences"`
+	FalseCount   int    `json:"false_count"`
 }
 
 type PreviousPingResults struct {
@@ -56,13 +57,26 @@ type PingState struct {
 	Alive       bool
 	GroupID     int
 	NetworkID   int
-	Recurrences int
+	Recurrences int  // Оставляем для обратной совместимости
+	FalseCount 	int  // Новый счетчик только для false-состояний
 }
 
 func readLastPingFile() (map[string]PingState, error) {
 	// Проверить, существует ли файл
 	if _, err := os.Stat("last_ping.json"); os.IsNotExist(err) {
-		// Файл не существует, вернуть пустую карту
+		// Файл не существует, создаем его с пустой структурой
+		initialData := PreviousPingResults{
+			Devices:  []PingResult{},
+			Datetime: "",
+		}
+		data, err := json.MarshalIndent(initialData, "", "  ")
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile("last_ping.json", data, 0644); err != nil {
+			return nil, err
+		}
+		// Файл создан, возвращаем пустую карту
 		return make(map[string]PingState), nil
 	}
 
@@ -86,6 +100,7 @@ func readLastPingFile() (map[string]PingState, error) {
 			GroupID:     device.GroupID,
 			NetworkID:   device.NetworkID,
 			Recurrences: device.Recurrences,
+			FalseCount:  device.FalseCount, // Используем значение из файла
 		}
 	}
 
@@ -256,7 +271,7 @@ func fetchSubnetsFromDB(ctx context.Context, db *pgxpool.Pool, groupIDs []int) (
 }
 
 // Опрос уникальных альтернативных IP-адресов, результаты уходят в resultsCh
-func pollAlternativeIPs(ctx context.Context, uniqueAltIPs []string, workers int, resultsCh chan<- map[string]bool) {
+func pollAlternativeIPs(ctx context.Context, uniqueAltIPs []string, workers int, fpingTimeoutMs int, resultsCh chan<- map[string]bool) {
 	if workers <= 0 {
 		workers = 10
 	}
@@ -271,7 +286,7 @@ func pollAlternativeIPs(ctx context.Context, uniqueAltIPs []string, workers int,
 	jobs := make(chan []string)
 
 	// Разбиваем список альтернативных IP на чанки для обработки
-	chunkSize := 50 // Обрабатываем по 50 IP за раз, чтобы не перегружать fping
+	chunkSize := 200 // Обрабатываем по 200 IP за раз, чтобы не перегружать fping
 	var chunks [][]string
 	for i := 0; i < len(uniqueAltIPs); i += chunkSize {
 		end := i + chunkSize
@@ -294,13 +309,13 @@ func pollAlternativeIPs(ctx context.Context, uniqueAltIPs []string, workers int,
 				}
 
 				// Используем fping для опроса списка IP-адресов
-				args := []string{"-c", "2", "-t", "500", "-a"}
+				args := []string{"-c", "2", "-t", fmt.Sprintf("%d", fpingTimeoutMs), "-a"}
 				args = append(args, chunk...) // Добавляем все IP-адреса в команду
 				cmd := exec.CommandContext(ctx, "fping", args...)
 
 				output, err := cmd.CombinedOutput()
 
-				fmt.Printf("\n[fping alternative IPs] cmd: fping %s\n", strings.Join(args, " "))
+				// fmt.Printf("\n[fping alternative IPs] cmd: fping %s\n", strings.Join(args, " "))
 
 				if err != nil {
 					if exitErr, ok := err.(*exec.ExitError); ok {
@@ -363,7 +378,7 @@ func pollAlternativeIPs(ctx context.Context, uniqueAltIPs []string, workers int,
 }
 
 // Опрос подсетей, результаты уходят в resultsCh
-func pollSubnets(ctx context.Context, subnets []Subnet, workers int, resultsCh chan<- map[string]bool) {
+func pollSubnets(ctx context.Context, subnets []Subnet, workers int, fpingTimeoutMs int, resultsCh chan<- map[string]bool) {
 	if workers <= 0 {
 		workers = 10
 	}
@@ -384,12 +399,12 @@ func pollSubnets(ctx context.Context, subnets []Subnet, workers int, resultsCh c
 				}
 
 				// Используем fping с флагом -g для опроса подсети
-				args := []string{"-c", "2", "-t", "500", "-a", "-g", s.Subnet}
+				args := []string{"-c", "2", "-t", fmt.Sprintf("%d", fpingTimeoutMs), "-a", "-g", s.Subnet}
 				cmd := exec.CommandContext(ctx, "fping", args...)
 
 				output, err := cmd.CombinedOutput()
 
-				fmt.Printf("\n[fping subnet %s] cmd: fping %s\n", s.Subnet, strings.Join(args, " "))
+				// fmt.Printf("\n[fping subnet %s] cmd: fping %s\n", s.Subnet, strings.Join(args, " "))
 
 				if err != nil {
 					if exitErr, ok := err.(*exec.ExitError); ok {
@@ -512,29 +527,10 @@ func runPinger(ctx context.Context, db *pgxpool.Pool, cfg Config) {
 
 	// Загрузка предыдущих результатов
 	pingStates, err := readLastPingFile()
-	var isFirstPing bool
 	if err != nil {
 		log.Printf("Ошибка чтения предыдущих результатов из файла: %v", err)
-		// Если файл не существует, это первый пинг
-		if _, fileErr := os.Stat("last_ping.json"); os.IsNotExist(fileErr) {
-			log.Println("Первый пинг - файл last_ping.json не существует, результаты не будут записаны в БД")
-			isFirstPing = true
-		} else {
-			// Если файл существует, но не удалось его прочитать (например, поврежден),
-			// считаем это как первый пинг для предотвращения записи всех устройств в БД
-			log.Println("Файл last_ping.json существует, но не удалось его прочитать - считаем как первый пинг")
-			isFirstPing = true
-		}
-		// Если файл не существует или ошибка чтения, инициализируем пустую мапу
+		// Если не удалось прочитать файл, инициализируем пустую мапу
 		pingStates = make(map[string]PingState)
-	} else {
-		isFirstPing = false
-	}
-
-	// ВАЖНО: При первом запуске (когда файл last_ping.json не существует)
-	// мы не записываем результаты опроса в базу данных, а только формируем файл last_ping.json
-	if isFirstPing {
-		log.Println("Пропускаем запись в ping_history при первом запуске")
 	}
 
 	// Каналы для результатов опроса
@@ -594,23 +590,77 @@ func runPinger(ctx context.Context, db *pgxpool.Pool, cfg Config) {
 					}
 					processedResults[mapKey] = true
 
-					// Проверяем, изменилось ли состояние
+					// Проверяем изменение состояния
 					oldState, exists := pingStates[key]
 					newState := PingState{
-						Alive:     alive,
-						GroupID:   subnet.GroupID,
-						NetworkID: subnet.ID,
-						// Увеличиваем Recurrences, если IP был в том же состоянии
+						Alive:      alive,
+						GroupID:    subnet.GroupID,
+						NetworkID:  subnet.ID,
 						Recurrences: 1,
+						FalseCount:  0,
 					}
 
-					if exists && oldState.Alive == alive {
-						// Если состояние осталось таким же, увеличиваем счетчик
-						newState.Recurrences = oldState.Recurrences + 1
+					if exists {
+						// Сценарий: true -> true
+						if oldState.Alive && alive {
+							newState.Recurrences = oldState.Recurrences + 1
+							newState.FalseCount = 0
+						} else if oldState.Alive && !alive {
+							// Сценарий: true -> false (1st occurrence)
+							newState.Recurrences = oldState.Recurrences + 1
+							newState.FalseCount = oldState.FalseCount + 1
+							// Оставляем alive = true до тех пор, пока не будет 3 подтверждений
+							newState.Alive = true
+						} else if !oldState.Alive && alive {
+							// Сценарий: false -> true
+							newState.Recurrences = 1
+							newState.FalseCount = 0
+						} else if !oldState.Alive && !alive {
+							// Сценарий: false -> false
+							newState.Recurrences = oldState.Recurrences + 1
+							newState.FalseCount = 0 // FalseCount используется только при переходе true->false
+						}
+					} else {
+						// Сценарий: Новое устройство
+						if alive {
+							// Новое true - recurrences=1, FalseCount=0, alive=True
+							newState.Recurrences = 1
+							newState.FalseCount = 0
+						} else {
+							// Новое false - recurrences=1, FalseCount=1, alive=False
+							newState.Recurrences = 1
+							newState.FalseCount = 1
+						}
 					}
 
-					// Если состояние изменилось и это не первый пинг, сохраняем в базу
-					if (!exists || oldState.Alive != newState.Alive) && !isFirstPing {
+					// Записываем в БД по новым правилам в соответствии с README таблицей
+					writeToDB := false
+
+					// Сценарии записи в БД:
+					// true -> false (3rd occurrence) - Да (FalseCount >= false_count_threshold)
+					// false -> true - Да
+					if !oldState.Alive && alive && exists {
+						// false -> true: записываем в БД
+						writeToDB = true
+					} else if oldState.Alive && !alive && exists && newState.FalseCount >= cfg.FalseCountThreshold {
+						// true -> false (threshold occurrence): записываем в БД
+						writeToDB = true
+						newState.Recurrences = cfg.FalseCountThreshold  // Фиксируем количество повторений из конфига
+					} else if !exists && alive {
+						// Новое true: не записываем в БД
+						writeToDB = false
+					} else if !exists && !alive {
+						// Новое false: не записываем в БД (FalseCount=1)
+						writeToDB = false
+					}
+
+					// После проверки условий, обновляем newState.Alive, если FalseCount достиг порога
+					if oldState.Alive && !alive && exists && newState.FalseCount >= cfg.FalseCountThreshold {
+						newState.Alive = false // alive становится false после порога
+						newState.FalseCount = 0 // Обнуляем, т.к. alive теперь false
+					}
+
+					if writeToDB {
 						if err := insertPingHistory(ctx, db, newState.GroupID, newState.NetworkID, ip, newState.Alive); err != nil {
 							log.Printf("Ошибка вставки в ping_history: %v", err)
 						}
@@ -621,13 +671,14 @@ func runPinger(ctx context.Context, db *pgxpool.Pool, cfg Config) {
 					// Добавляем в результаты
 					allResults = append(allResults, PingResult{
 						IP:           ip,
-						Alive:        alive,
+						Alive:        newState.Alive,
 						Description:  subnet.Description,
 						SourceSubnet: subnet.Subnet,
 						Timestamp:    time.Now().Format("2006-01-02 15:04:05"),
 						GroupID:      subnet.GroupID,
 						NetworkID:    subnet.ID,
 						Recurrences:  newState.Recurrences,
+						FalseCount:   newState.FalseCount,
 					})
 				}
 			}
@@ -657,13 +708,67 @@ func runPinger(ctx context.Context, db *pgxpool.Pool, cfg Config) {
 							Recurrences: 1,
 						}
 
-						if exists && oldState.Alive == alive {
-							// Если состояние осталось таким же, увеличиваем счетчик
-							newState.Recurrences = oldState.Recurrences + 1
+						if exists {
+							// Сценарий: true -> true
+							if oldState.Alive && alive {
+								newState.Recurrences = oldState.Recurrences + 1
+								newState.FalseCount = 0
+							} else if oldState.Alive && !alive {
+								// Сценарий: true -> false (1st occurrence)
+								newState.Recurrences = oldState.Recurrences + 1
+								newState.FalseCount = oldState.FalseCount + 1
+								// Оставляем alive = true до тех пор, пока не будет 3 подтверждений
+								newState.Alive = true
+							} else if !oldState.Alive && alive {
+								// Сценарий: false -> true
+								newState.Recurrences = 1
+								newState.FalseCount = 0
+							} else if !oldState.Alive && !alive {
+								// Сценарий: false -> false
+								newState.Recurrences = oldState.Recurrences + 1
+								newState.FalseCount = 0 // FalseCount используется только при переходе true->false
+							}
+						} else {
+							// Сценарий: Новое устройство
+							if alive {
+								// Новое true - recurrences=1, FalseCount=0, alive=True
+								newState.Recurrences = 1
+								newState.FalseCount = 0
+							} else {
+								// Новое false - recurrences=1, FalseCount=1, alive=False
+								newState.Recurrences = 1
+								newState.FalseCount = 1
+							}
 						}
 
-						// Если состояние изменилось и это не первый пинг, сохраняем в базу
-						if (!exists || oldState.Alive != newState.Alive) && !isFirstPing {
+						// Применяем ту же логику для альтернативных IP
+						writeToDB := false
+
+						// Сценарии записи в БД:
+						// true -> false (threshold occurrence) - Да (FalseCount >= false_count_threshold)
+						// false -> true - Да
+						if !oldState.Alive && alive && exists {
+							// false -> true: записываем в БД
+							writeToDB = true
+						} else if oldState.Alive && !alive && exists && newState.FalseCount >= cfg.FalseCountThreshold {
+							// true -> false (threshold occurrence): записываем в БД
+							writeToDB = true
+							newState.Recurrences = cfg.FalseCountThreshold  // Фиксируем количество повторений из конфига
+						} else if !exists && alive {
+							// Новое true: не записываем в БД
+							writeToDB = false
+						} else if !exists && !alive {
+							// Новое false: не записываем в БД (FalseCount=1)
+							writeToDB = false
+						}
+
+						// После проверки условий, обновляем newState.Alive, если FalseCount достиг порога
+						if oldState.Alive && !alive && exists && newState.FalseCount >= cfg.FalseCountThreshold {
+							newState.Alive = false // alive становится false после порога
+							newState.FalseCount = 0 // Обнуляем, т.к. alive теперь false
+						}
+
+						if writeToDB {
 							if err := insertPingHistory(ctx, db, newState.GroupID, newState.NetworkID, ip, newState.Alive); err != nil {
 								log.Printf("Ошибка вставки в ping_history для альтернативного IP: %v", err)
 							}
@@ -674,13 +779,14 @@ func runPinger(ctx context.Context, db *pgxpool.Pool, cfg Config) {
 						// Добавляем в результаты
 						allResults = append(allResults, PingResult{
 							IP:           ip,
-							Alive:        alive,
+							Alive:        newState.Alive,
 							Description:  altSubnet.Description,
 							SourceSubnet: altSubnet.Subnet,
 							Timestamp:    time.Now().Format("2006-01-02 15:04:05"),
 							GroupID:      altSubnet.GroupID,
 							NetworkID:    altSubnet.ID,
 							Recurrences:  newState.Recurrences,
+							FalseCount:   newState.FalseCount,
 						})
 					}
 				}
@@ -690,12 +796,12 @@ func runPinger(ctx context.Context, db *pgxpool.Pool, cfg Config) {
 
 	// Одновременный опрос подсетей и альтернативных IP
 	go func() {
-		pollSubnets(ctx, subnets, cfg.Workers, subnetResultsCh)
+		pollSubnets(ctx, subnets, cfg.Workers, cfg.FpingTimeoutMs, subnetResultsCh)
 		close(subnetResultsCh)
 	}()
 
 	go func() {
-		pollAlternativeIPs(ctx, uniqueAltIPStrings, cfg.Workers, altIPResultsCh)
+		pollAlternativeIPs(ctx, uniqueAltIPStrings, cfg.Workers, cfg.FpingTimeoutMs, altIPResultsCh)
 		close(altIPResultsCh)
 	}()
 
@@ -724,9 +830,11 @@ func runPinger(ctx context.Context, db *pgxpool.Pool, cfg Config) {
 }
 
 type Config struct {
-	DatabaseURL     string `json:"database_url"`
-	PollIntervalSec int    `json:"poll_interval_seconds"`
-	Workers         int    `json:"workers"`
+	DatabaseURL         string `json:"database_url"`
+	PollIntervalSec     int    `json:"poll_interval_seconds"`
+	Workers             int    `json:"workers"`
+	FalseCountThreshold int    `json:"false_count_threshold"`
+	FpingTimeoutMs      int    `json:"fping_timeout_ms"`
 }
 
 func loadDBConfig(path string) (Config, error) {
@@ -745,6 +853,11 @@ func loadDBConfig(path string) (Config, error) {
 	// Значение по умолчанию, если не указано в конфиге
 	if cfg.PollIntervalSec <= 0 {
 		cfg.PollIntervalSec = 10
+	}
+
+	// Установка значения по умолчанию для FalseCountThreshold, если не указано
+	if cfg.FalseCountThreshold <= 0 {
+		cfg.FalseCountThreshold = 3
 	}
 
 	return cfg, nil
