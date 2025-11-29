@@ -1,5 +1,7 @@
 {
   "database_url": "postgresql://postgres:postgres@<docker_gateway_ip>:1234/postgres",
   "poll_interval_seconds": 30,
-  "workers": 60
+  "workers": 60,
+  "false_count_threshold": 3,
+  "fping_timeout_ms": 1000
 }
