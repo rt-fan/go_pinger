@@ -77,7 +77,6 @@ Hostname: postgres
       "network_id": 56,
       "recurrences": 3
     },
-    {…} ,
     {
       "ip": "10.40.50.2",
       "alive": true,
@@ -99,7 +98,7 @@ Hostname: postgres
       "recurrences": 3
     }
   ],
-  “duration”: 5.63 s,
+  "duration": 5.63 s,
   "datetime": "2025-11-25 22:31:31"
 }
 ```
