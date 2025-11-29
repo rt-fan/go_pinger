@@ -98,7 +98,7 @@ Hostname: postgres
       "recurrences": 3
     }
   ],
-  "duration": 5.63 s,
+  "duration": 5.63,
   "datetime": "2025-11-25 22:31:31"
 }
 ```
