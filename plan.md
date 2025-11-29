@@ -107,3 +107,16 @@ Hostname: postgres
 9. Если файл существует - проверяем каждый ip адрес на совпадение состояний устройств. Если состояния совпадают - увеличиваем значение поля "recurrences" на +1. Если состояния не совпадают или если устройства с таким ip-адресом еще нет в last_ping.json - устанавливаем значение "recurrences" равным 1, перезаписываем актуальное время опроса и состояние, а так же записываем в БД в таблицу ping_history данные об изменении состояния устройства (group_id, network_id, ipaddress, state, changed_at).
 10. Скрипт должен запускаться каждые 30 секунд.
 
+
+✅ **Логика разбора результатов и записи состояний устройств в БД** 
+
+| Сценарий         | Запись в БД          | Действия                                 |
+| ---------------- | -------------------- | ---------------------------------------- |
+| Новое true       | ❌ Нет                | Recurrences=1, FalseCount=0, alive=True  |
+| Новое false      | ❌ Нет (FalseCount=1) | Recurrences+1, FalseCount=0, alive=False |
+| true → true      | ❌ Нет                | Recurrences+1, FalseCount=0, alive=True  |
+| true → false (1) | ❌ Нет (FalseCount=1) | Recurrences+1, FalseCount+1, alive=True  |
+| true → false (2) | ❌ Нет (FalseCount=2) | Recurrences+1, FalseCount+1, alive=True  |
+| true → false (3) | ✅ Да (FalseCount=3)  | Recurrences=3, FalseCount=0, alive=False |
+| false → true     | ✅ Да                 | Recurrences=1, FalseCount=0, alive=True  |
+| false → false    | ❌ Нет                | Recurrences+1, FalseCount=0, alive=False |
